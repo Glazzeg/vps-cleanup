@@ -1,145 +1,115 @@
 #!/usr/bin/env bash
-# Conservative disk cleanup for Ubuntu VPS. Defaults to a preview; see --help.
+# VPS disk cleanup. Scans first, then asks once before making changes.
 set -Eeuo pipefail
 umask 077
 
-APPLY=0
-DO_AUTOREMOVE=0
-DO_DOCKER=0
-DO_CACHES=0
-DO_TMP=0
-
-usage() {
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   cat <<'EOF'
-Usage: sudo bash cleanup.sh [options]
+Usage: sudo bash cleanup.sh
 
-Default: preview only. With --apply, run the conservative cleanup tasks:
-  - APT package cache cleanup
-  - journald vacuum (logs older than 7 days; cap at 200 MB)
-  - old rotated log files (over 30 days)
+Checks common cleanup targets, displays what it found, then asks once:
+  [y/N] to proceed, any other key to cancel.
 
-Optional cleanup tasks require explicit opt-in:
-  --autoremove  APT autoremove (review the displayed package list first)
-  --docker      Remove unused Docker images and build cache (never volumes)
-  --caches      Purge pip/npm caches for root only
-  --tmp         Remove regular files in /tmp older than 7 days and /var/tmp
-                older than 30 days (review preview; active files can be affected)
-  --apply       Execute selected tasks; asks for confirmation
-  -h, --help    Show this help
-
-Examples:
-  bash cleanup.sh                         # preview
-  sudo bash cleanup.sh --apply            # conservative cleanup
-  sudo bash cleanup.sh --autoremove       # preview APT autoremove candidates
-  sudo bash cleanup.sh --apply --docker   # include Docker image/cache cleanup
+May clean APT packages/cache, old journald and rotated logs, unused Docker
+images/build cache, old disabled Snap revisions, root pip/npm caches, and old
+regular files in /tmp and /var/tmp. Docker containers and volumes are untouched.
 EOF
-}
-
-for arg in "$@"; do
-  case "$arg" in
-    --apply) APPLY=1 ;;
-    --autoremove) DO_AUTOREMOVE=1 ;;
-    --docker) DO_DOCKER=1 ;;
-    --caches) DO_CACHES=1 ;;
-    --tmp) DO_TMP=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Неизвестный параметр: $arg" >&2; usage >&2; exit 2 ;;
-  esac
-done
+  exit 0
+fi
+if (( $# > 0 )); then echo "Неизвестный параметр: $1" >&2; exit 2; fi
+if [[ $EUID -ne 0 ]]; then echo "Запусти от root: sudo bash $0" >&2; exit 1; fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 step() { printf '\n==> %s\n' "$1"; }
 avail_bytes() { df --output=avail -B1 / | tail -n1 | tr -d ' '; }
 human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1 B"; }
-run() {
-  if (( APPLY )); then "$@"; else printf '[просмотр]'; printf ' %q' "$@"; printf '\n'; fi
-}
-
-if (( APPLY )) && [[ $EUID -ne 0 ]]; then
-  echo "Для --apply запусти от root: sudo bash $0 --apply" >&2
-  exit 1
-fi
-
-if (( ! APPLY )); then
-  echo "Режим просмотра: ничего не будет удалено. Для выполнения добавь --apply."
-else
-  read -r -p "Будут выполнены выбранные операции очистки. Продолжить? Введи YES: " confirm
-  [[ "$confirm" == YES ]] || { echo "Отменено."; exit 0; }
-fi
 
 BEFORE=$(avail_bytes)
-echo "Свободно до очистки: $(human "$BEFORE")"
+echo "Проверяю, что можно очистить. Свободно сейчас: $(human "$BEFORE")"
 df -h / | tail -n1
 
-step "APT: кеш пакетов"
-have apt-get && run apt-get clean || echo "apt-get не найден, пропускаю."
+step "APT: кеш и неиспользуемые пакеты"
+if have apt-get; then
+  echo "Кеш пакетов APT будет очищен. План autoremove:"
+  apt-get -s autoremove --purge || true
+else echo "APT не найден."; fi
 
-if (( DO_AUTOREMOVE )); then
-  step "APT: список кандидатов autoremove"
-  if have apt-get; then
-    if (( APPLY )); then
-      apt-get -s autoremove --purge
-      read -r -p "Показанный список пакетов допустимо удалить? Введи YES: " answer
-      [[ "$answer" == YES ]] || { echo "Autoremove пропущен."; }
-      [[ "$answer" == YES ]] && apt-get autoremove --purge
-    else
-      apt-get -s autoremove --purge
-    fi
-  fi
-fi
+step "journald: логи старше 7 дней и ограничение 200 МБ"
+if have journalctl; then journalctl --disk-usage 2>/dev/null || true; else echo "journald не найден."; fi
 
-step "journald: старше 7 дней / свыше 200 МБ"
-if have journalctl; then
-  run journalctl --vacuum-time=7d
-  run journalctl --vacuum-size=200M
-else echo "journalctl не найден, пропускаю."; fi
-
-step "Старые ротированные логи в /var/log (старше 30 дней)"
-if (( APPLY )); then
-  find /var/log -xdev -type f -mtime +30 \
-    \( -name '*.gz' -o -name '*.xz' -o -name '*.old' -o -name '*.[0-9]' -o -name '*.[0-9].log' \) \
-    -print -delete 2>/dev/null || true
-else
+step "Ротированные логи старше 30 дней"
+if [[ -d /var/log ]]; then
   find /var/log -xdev -type f -mtime +30 \
     \( -name '*.gz' -o -name '*.xz' -o -name '*.old' -o -name '*.[0-9]' -o -name '*.[0-9].log' \) \
     -print 2>/dev/null || true
 fi
 
-if (( DO_DOCKER )); then
-  step "Docker: неиспользуемые образы и build-кеш; тома не трогаются"
-  if have docker && docker info >/dev/null 2>&1; then
-    run docker image prune -a
-    run docker builder prune
-  else echo "Docker недоступен, пропускаю."; fi
+step "Docker: неиспользуемые образы и build-кеш (без контейнеров и томов)"
+DOCKER_READY=0
+if have docker && docker info >/dev/null 2>&1; then DOCKER_READY=1; docker system df || true; else echo "Docker не установлен или недоступен."; fi
+
+step "Snap: старые отключённые ревизии"
+if have snap; then
+  snap list --all 2>/dev/null | awk '/disabled/{print}' || true
+else echo "Snap не установлен."; fi
+
+step "Кеш pip/npm пользователя root"
+have pip3 && pip3 cache info 2>/dev/null || true
+have pip && pip cache info 2>/dev/null || true
+have npm && npm cache ls 2>/dev/null | tail -n 5 || true
+
+step "Временные файлы (только файлы старше заданного срока)"
+[[ ! -d /tmp ]] || find /tmp -xdev -type f -mtime +7 -print 2>/dev/null || true
+[[ ! -d /var/tmp ]] || find /var/tmp -xdev -type f -mtime +30 -print 2>/dev/null || true
+
+printf '\nОчистить перечисленное? [y/N]: '
+read -r -n 1 answer || true
+printf '\n'
+case "$answer" in y|Y) ;; *) echo "Отменено, ничего не удалено."; exit 0 ;; esac
+
+export DEBIAN_FRONTEND=noninteractive
+step "APT"
+if have apt-get; then
+  apt-get clean
+  apt-get autoremove --purge -y
+  apt-get autoclean -y
 fi
 
-if (( DO_CACHES )); then
-  step "Кеши pip/npm пользователя root"
-  if have pip3; then run pip3 cache purge; fi
-  if have pip; then run pip cache purge; fi
-  if have npm; then run npm cache clean --force; fi
+step "journald"
+if have journalctl; then journalctl --vacuum-time=7d; journalctl --vacuum-size=200M; fi
+
+step "Ротированные логи"
+if [[ -d /var/log ]]; then
+  find /var/log -xdev -type f -mtime +30 \
+    \( -name '*.gz' -o -name '*.xz' -o -name '*.old' -o -name '*.[0-9]' -o -name '*.[0-9].log' \) \
+    -print -delete 2>/dev/null || true
 fi
 
-if (( DO_TMP )); then
-  step "Временные файлы: /tmp старше 7 дней, /var/tmp старше 30 дней"
-  for spec in "/tmp 7" "/var/tmp 30"; do
-    read -r dir days <<< "$spec"
-    [[ -d "$dir" ]] || continue
-    if (( APPLY )); then
-      find "$dir" -xdev -type f -mtime "+$days" -print -delete 2>/dev/null || true
-    else
-      find "$dir" -xdev -type f -mtime "+$days" -print 2>/dev/null || true
-    fi
+step "Docker"
+if (( DOCKER_READY )); then
+  docker image prune -a -f
+  docker builder prune -a -f
+fi
+
+step "Snap"
+if have snap; then
+  snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | while read -r name rev; do
+    [[ -n "$name" && -n "$rev" ]] && snap remove "$name" --revision="$rev"
   done
 fi
 
-if (( APPLY )); then
-  AFTER=$(avail_bytes)
-  FREED=$(( AFTER - BEFORE )); (( FREED < 0 )) && FREED=0
-  step "Готово"
-  echo "Свободно после очистки: $(human "$AFTER")"
-  echo "Освобождено: $(human "$FREED")"
-  df -h / | tail -n1
-else
-  echo "Предпросмотр завершён."
-fi
+step "Кеши pip/npm пользователя root"
+have pip3 && pip3 cache purge || true
+have pip && pip cache purge || true
+have npm && npm cache clean --force || true
+
+step "Временные файлы"
+[[ ! -d /tmp ]] || find /tmp -xdev -type f -mtime +7 -print -delete 2>/dev/null || true
+[[ ! -d /var/tmp ]] || find /var/tmp -xdev -type f -mtime +30 -print -delete 2>/dev/null || true
+
+AFTER=$(avail_bytes)
+FREED=$(( AFTER - BEFORE )); (( FREED < 0 )) && FREED=0
+step "Готово"
+echo "Свободно после очистки: $(human "$AFTER")"
+echo "Освобождено: $(human "$FREED")"
+df -h / | tail -n1
