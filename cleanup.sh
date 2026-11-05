@@ -54,17 +54,23 @@ if have snap; then
 else echo "Snap не установлен."; fi
 
 step "Кеш pip/npm пользователя root"
-have pip3 && pip3 cache info 2>/dev/null || true
-have pip && pip cache info 2>/dev/null || true
-have npm && npm cache ls 2>/dev/null | tail -n 5 || true
+if have pip3; then pip3 cache info 2>/dev/null || true
+elif have pip; then pip cache info 2>/dev/null || true
+fi
+if have npm && [[ -d /root/.npm ]]; then du -sh /root/.npm 2>/dev/null || true; fi
 
 step "Временные файлы (только файлы старше заданного срока)"
 [[ ! -d /tmp ]] || find /tmp -xdev -type f -mtime +7 -print 2>/dev/null || true
 [[ ! -d /var/tmp ]] || find /var/tmp -xdev -type f -mtime +30 -print 2>/dev/null || true
 
-printf '\nОчистить перечисленное? [y/N]: '
-read -r -n 1 answer || true
-printf '\n'
+if [[ ! -r /dev/tty ]]; then
+  echo "Не найден терминал для подтверждения. Ничего не удалено." >&2
+  exit 1
+fi
+answer=''
+printf '\nОчистить перечисленное? [y/N]: ' > /dev/tty
+read -r -n 1 answer </dev/tty || true
+printf '\n' > /dev/tty
 case "$answer" in y|Y) ;; *) echo "Отменено, ничего не удалено."; exit 0 ;; esac
 
 export DEBIAN_FRONTEND=noninteractive
